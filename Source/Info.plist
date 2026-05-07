@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleExecutable</key>
+    <string>VolMirror</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.joaopedro.VolMirror</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>VolMirror</string>
+    <key>CFBundlePackageType</key>
+    <string>BNDL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>CFPlugInDynamicRegistration</key>
+    <false/>
+    <key>CFPlugInFactories</key>
+    <dict>
+        <key>5A9B3C0E-7A1F-4B5D-8C2E-1F3A4B5C6D7E</key>
+        <string>VolMirror_Factory</string>
+    </dict>
+    <key>CFPlugInTypes</key>
+    <dict>
+        <key>443ABAB8-E7B3-491A-B985-BEB9187030DB</key>
+        <array>
+            <string>5A9B3C0E-7A1F-4B5D-8C2E-1F3A4B5C6D7E</string>
+        </array>
+    </dict>
+    <key>NSHumanReadableCopyright</key>
+    <string>Personal use.</string>
+</dict>
+</plist>
