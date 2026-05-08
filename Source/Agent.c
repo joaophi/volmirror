@@ -27,8 +27,12 @@
 #define VMERR(fmt, ...) os_log_error(OS_LOG_DEFAULT, "[VolMirrorAgent] " fmt, ##__VA_ARGS__)
 
 // Custom property selectors — must match Source/Plugin.c.
-#define kVMProperty_FollowTarget    'flwt'
-#define kVMProperty_FollowName      'fldn'
+#define kVMProperty_FollowTarget        'flwt'
+#define kVMProperty_FollowName          'fldn'
+#define kVMProperty_FollowIcon          'flic'
+#define kVMProperty_FollowManufacturer  'flmf'
+#define kVMProperty_FollowRate          'flsr'
+#define kVMProperty_FollowTransport     'fltt'
 
 #define kMaxBridges        8
 #define kAgentRingFrames   8192     // power of 2; ~170 ms at 48 kHz of slack between IOProcs
@@ -135,6 +139,38 @@ static OSStatus set_cfstring(AudioObjectID dev, AudioObjectPropertySelector sel,
     OSStatus err = AudioObjectSetPropertyData(dev, &a, 0, NULL, sizeof(s), &s);
     CFRelease(s);
     return err;
+}
+
+// Read the device's icon URL and convert to a POSIX file path.
+static OSStatus get_real_icon_path(AudioObjectID dev, char* dst, size_t size) {
+    AudioObjectPropertyAddress a = { kAudioDevicePropertyIcon,
+                                     kAudioObjectPropertyScopeGlobal,
+                                     kAudioObjectPropertyElementMain };
+    CFURLRef url = NULL; UInt32 sz = sizeof(url);
+    OSStatus err = AudioObjectGetPropertyData(dev, &a, 0, NULL, &sz, &url);
+    if (err != noErr || !url) { dst[0] = 0; return err; }
+    if (!CFURLGetFileSystemRepresentation(url, true, (UInt8*)dst, (CFIndex)size))
+        dst[0] = 0;
+    CFRelease(url);
+    return noErr;
+}
+
+static Float64 get_real_rate(AudioObjectID dev) {
+    AudioObjectPropertyAddress a = { kAudioDevicePropertyNominalSampleRate,
+                                     kAudioObjectPropertyScopeGlobal,
+                                     kAudioObjectPropertyElementMain };
+    Float64 r = 0.0; UInt32 sz = sizeof(r);
+    if (AudioObjectGetPropertyData(dev, &a, 0, NULL, &sz, &r) == noErr && r > 0) return r;
+    return 48000.0;
+}
+
+static UInt32 get_real_transport(AudioObjectID dev) {
+    AudioObjectPropertyAddress a = { kAudioDevicePropertyTransportType,
+                                     kAudioObjectPropertyScopeGlobal,
+                                     kAudioObjectPropertyElementMain };
+    UInt32 t = 0; UInt32 sz = sizeof(t);
+    AudioObjectGetPropertyData(dev, &a, 0, NULL, &sz, &t);
+    return t;
 }
 
 // ---------- Real-device classification ----------
@@ -271,29 +307,37 @@ static void bridge_stop(Bridge* b) {
 
 // ---------- Reconcile ----------
 
-// Find a live VolMirror virtual device whose target either matches `realUID`
-// (already assigned) or is empty (free for us to assign).
-typedef struct { AudioObjectID dev; char uid[256]; char curTarget[224]; } VirtSlot;
+// Look up a device by UID via the system object. Works for hidden devices,
+// which kAudioHardwarePropertyDevices and kAudioPlugInPropertyDeviceList both
+// filter out. Returns kAudioObjectUnknown if the UID isn't currently held.
+static AudioObjectID translate_uid(const char* uid) {
+    CFStringRef cf = CFStringCreateWithCString(NULL, uid, kCFStringEncodingUTF8);
+    if (!cf) return kAudioObjectUnknown;
+    AudioObjectID dev = kAudioObjectUnknown;
+    AudioObjectPropertyAddress a = { kAudioHardwarePropertyTranslateUIDToDevice,
+                                     kAudioObjectPropertyScopeGlobal,
+                                     kAudioObjectPropertyElementMain };
+    UInt32 sz = sizeof(dev);
+    AudioObjectGetPropertyData(kAudioObjectSystemObject, &a,
+                               sizeof(cf), &cf, &sz, &dev);
+    CFRelease(cf);
+    return dev;
+}
 
-static int collect_virt_slots(VirtSlot* out, int cap) {
-    UInt32 nDev = 0;
-    AudioObjectID* devs = enumerate_devices(&nDev);
-    if (!devs) return 0;
-    int n = 0;
-    for (UInt32 i = 0; i < nDev && n < cap; i++) {
-        char uid[256] = {0};
-        get_cfstring(devs[i], kAudioDevicePropertyDeviceUID,
-                     kAudioObjectPropertyScopeGlobal, uid, sizeof(uid));
-        if (strncmp(uid, "VolMirror/", 10) != 0) continue;
-        out[n].dev = devs[i];
-        snprintf(out[n].uid, sizeof(out[n].uid), "%s", uid);
-        get_cfstring(devs[i], kVMProperty_FollowTarget,
-                     kAudioObjectPropertyScopeGlobal,
-                     out[n].curTarget, sizeof(out[n].curTarget));
-        n++;
+// Find the VolMirror device for a given real UID — either an existing
+// assignment ("VolMirror/<realUID>") or the lowest free slot
+// ("VolMirror/slot/N"). Returns kAudioObjectUnknown if all slots are taken.
+static AudioObjectID find_or_pick_slot(const char* realUID) {
+    char buf[300];
+    snprintf(buf, sizeof(buf), "VolMirror/%s", realUID);
+    AudioObjectID dev = translate_uid(buf);
+    if (dev != kAudioObjectUnknown) return dev;
+    for (int n = 0; n < kMaxBridges; n++) {
+        snprintf(buf, sizeof(buf), "VolMirror/slot/%d", n);
+        dev = translate_uid(buf);
+        if (dev != kAudioObjectUnknown) return dev;
     }
-    free(devs);
-    return n;
+    return kAudioObjectUnknown;
 }
 
 static Bridge* find_bridge_by_real_uid(const char* uid) {
@@ -351,23 +395,12 @@ static void reconcile(void) {
         }
     }
 
-    // 3. Find the driver's virtual slots (state on the driver side).
-    VirtSlot virts[kMaxBridges * 2];
-    int nVirt = collect_virt_slots(virts, (int)(sizeof(virts)/sizeof(virts[0])));
-
-    // 4. For each present locked real output, ensure a bridge exists.
+    // 3. For each present locked real output, ensure a bridge exists.
     for (int j = 0; j < nReal; j++) {
         if (find_bridge_by_real_uid(reals[j].uid)) continue;     // already up
 
-        // Pick a virtual slot: prefer one whose target already matches us
-        // (driver remembers across coreaudiod restarts), else first unassigned.
-        VirtSlot* picked = NULL;
-        for (int k = 0; k < nVirt; k++)
-            if (strcmp(virts[k].curTarget, reals[j].uid) == 0) { picked = &virts[k]; break; }
-        if (!picked)
-            for (int k = 0; k < nVirt; k++)
-                if (virts[k].curTarget[0] == 0) { picked = &virts[k]; break; }
-        if (!picked) {
+        AudioObjectID virtDev = find_or_pick_slot(reals[j].uid);
+        if (virtDev == kAudioObjectUnknown) {
             VMLOG("no free virtual slot for %{public}s", reals[j].name);
             continue;
         }
@@ -378,22 +411,45 @@ static void reconcile(void) {
             continue;
         }
 
-        // Assign on the driver side first so the virtual device shows in UI.
+        // Proxy the real device's identity onto the slot before flipping
+        // FollowTarget — that way the slot is fully decorated by the time it
+        // becomes visible (single name/icon/manufacturer change in the UI).
+        char iconPath[1024]; iconPath[0] = 0;
+        get_real_icon_path(reals[j].id, iconPath, sizeof(iconPath));
+        char mfg[256]; mfg[0] = 0;
+        get_cfstring(reals[j].id, kAudioObjectPropertyManufacturer,
+                     kAudioObjectPropertyScopeGlobal, mfg, sizeof(mfg));
+        Float64 realRate = get_real_rate(reals[j].id);
+        char rateStr[32];
+        snprintf(rateStr, sizeof(rateStr), "%.6f", realRate);
+        UInt32 transport = get_real_transport(reals[j].id);
+        char transportStr[8] = {0};
+        transportStr[0] = (char)((transport >> 24) & 0xff);
+        transportStr[1] = (char)((transport >> 16) & 0xff);
+        transportStr[2] = (char)((transport >>  8) & 0xff);
+        transportStr[3] = (char)((transport      ) & 0xff);
+        VMLOG("proxy: name=%{public}s mfg=%{public}s rate=%{public}s transport=%{public}s",
+              reals[j].name, mfg[0] ? mfg : "(none)", rateStr,
+              transportStr[0] ? transportStr : "(none)");
         char displayName[300];
         snprintf(displayName, sizeof(displayName), "%s (Vol)", reals[j].name);
-        set_cfstring(picked->dev, kVMProperty_FollowName, displayName);
-        set_cfstring(picked->dev, kVMProperty_FollowTarget, reals[j].uid);
+
+        set_cfstring(virtDev, kVMProperty_FollowRate,         rateStr);
+        set_cfstring(virtDev, kVMProperty_FollowTransport,    transportStr);
+        set_cfstring(virtDev, kVMProperty_FollowIcon,         iconPath);
+        set_cfstring(virtDev, kVMProperty_FollowManufacturer, mfg);
+        set_cfstring(virtDev, kVMProperty_FollowName,         displayName);
+        set_cfstring(virtDev, kVMProperty_FollowTarget,       reals[j].uid);
 
         // Wire up the bridge.
-        b->virtDev = picked->dev;
+        b->virtDev = virtDev;
         b->realDev = reals[j].id;
         snprintf(b->realUID, sizeof(b->realUID), "%s", reals[j].uid);
-        snprintf(b->virtUID, sizeof(b->virtUID), "%s", picked->uid);
+        snprintf(b->virtUID, sizeof(b->virtUID), "VolMirror/%s", reals[j].uid);
         ring_init(&b->ring, kAgentRingFrames);
         if (!bridge_start(b)) {
-            // Roll back the driver assignment.
-            set_cfstring(picked->dev, kVMProperty_FollowTarget, "");
-            set_cfstring(picked->dev, kVMProperty_FollowName, "");
+            set_cfstring(virtDev, kVMProperty_FollowTarget, "");
+            set_cfstring(virtDev, kVMProperty_FollowName, "");
             free(b->ring.data); b->ring.data = NULL;
             memset(b, 0, sizeof(*b));
         }

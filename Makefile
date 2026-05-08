@@ -56,12 +56,18 @@ install: all
 	rm -rf $(INSTALL_DIR)/$(BUNDLE).$(EXT)
 	cp -R $(BUNDLE_DIR) $(INSTALL_DIR)/$(BUNDLE).$(EXT)
 	mkdir -p $(AGENT_INSTALL_DIR)
-	cp $(AGENT_BIN) $(AGENT_INSTALL)
-	cp Source/$(AGENT_PLIST) $(AGENT_PLIST_INSTALL)
+	install -m 755 $(AGENT_BIN) $(AGENT_INSTALL)
+	install -m 644 -o root -g wheel Source/$(AGENT_PLIST) $(AGENT_PLIST_INSTALL)
+	# Strip quarantine + warm Gatekeeper so the malware scan happens here
+	# instead of stalling the next login (avoids a multi-second hold on
+	# the user-session launchd queue at boot).
+	-@xattr -dr com.apple.quarantine $(INSTALL_DIR)/$(BUNDLE).$(EXT) $(AGENT_INSTALL) 2>/dev/null || true
+	-@spctl --assess --type execute $(AGENT_INSTALL) >/dev/null 2>&1 || true
 	$(MAKE) reload
 
 uninstall:
-	-launchctl bootout gui/$(USER_UID)/$(AGENT_LABEL) 2>/dev/null || true
+	-@launchctl bootout gui/$(USER_UID)/$(AGENT_LABEL) 2>/dev/null || true
+	-@killall -9 VolMirrorAgent 2>/dev/null || true
 	rm -f $(AGENT_INSTALL) $(AGENT_PLIST_INSTALL)
 	rm -rf $(INSTALL_DIR)/$(BUNDLE).$(EXT)
 	$(MAKE) reload-driver
@@ -71,6 +77,11 @@ reload: reload-driver reload-agent
 reload-driver:
 	@killall coreaudiod
 
+# If the agent's already bootstrapped, kickstart it (instant restart, works on
+# user-domain services even with SIP). Only bootstrap on first install.
 reload-agent:
-	-@launchctl bootout gui/$(USER_UID)/$(AGENT_LABEL) 2>/dev/null || true
-	@launchctl bootstrap gui/$(USER_UID) $(AGENT_PLIST_INSTALL)
+	@if launchctl print gui/$(USER_UID)/$(AGENT_LABEL) >/dev/null 2>&1; then \
+		launchctl kickstart -k gui/$(USER_UID)/$(AGENT_LABEL); \
+	else \
+		launchctl bootstrap gui/$(USER_UID) $(AGENT_PLIST_INSTALL); \
+	fi

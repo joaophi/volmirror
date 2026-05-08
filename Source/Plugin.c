@@ -30,9 +30,13 @@
 #define kZeroTimeStampPeriod    16384    // ≥ 10923 per AudioServerPlugIn.h
 #define kRingCapacity           4096     // frames, power of 2
 
-// Custom property selectors. CFString-valued.
-#define kVMProperty_FollowTarget    'flwt'
-#define kVMProperty_FollowName      'fldn'
+// Custom property selectors set by the agent.
+#define kVMProperty_FollowTarget        'flwt'  // CFString: real device UID; "" unassigns
+#define kVMProperty_FollowName          'fldn'  // CFString: display name shown in UI
+#define kVMProperty_FollowIcon          'flic'  // CFString: file path to .icns resource
+#define kVMProperty_FollowManufacturer  'flmf'  // CFString: overrides "VolMirror"
+#define kVMProperty_FollowRate          'flsr'  // CFString: ASCII Float64, e.g. "48000.0"
+#define kVMProperty_FollowTransport     'fltt'  // CFString: 4-char fourcc, e.g. "hdmi"
 
 static inline AudioObjectID dev_id(int i)    { return kFirstMirrorObjectID + i*10 + 0; }
 static inline AudioObjectID outstrm_id(int i){ return kFirstMirrorObjectID + i*10 + 1; }
@@ -112,6 +116,9 @@ typedef struct {
     char                realUID[224];       // "" when unassigned
     char                displayName[300];
     char                uid[260];           // synthesized; stable when unassigned
+    char                iconPath[1024];     // proxied from real device, "" if none
+    char                manufacturer[256];  // proxied from real device, "" → "VolMirror"
+    UInt32              transportType;      // proxied; 0 → kAudioDeviceTransportTypeVirtual
     _Atomic bool        assigned;
     Float64             sampleRate;
     _Atomic float       volume;             // 0..1
@@ -162,6 +169,8 @@ static Float32 db_to_scalar(Float32 d) {
 }
 
 // Re-derive synthesized fields from realUID. Caller holds m->mu.
+// On unassignment, also clear proxied properties so the next assignment
+// starts clean (rather than inheriting stale icon/manufacturer/rate).
 static void slot_resync(Mirror* m, int i) {
     if (m->realUID[0]) {
         snprintf(m->uid, sizeof(m->uid), "VolMirror/%s", m->realUID);
@@ -169,6 +178,11 @@ static void slot_resync(Mirror* m, int i) {
     } else {
         snprintf(m->uid, sizeof(m->uid), "VolMirror/slot/%d", i);
         atomic_store_explicit(&m->assigned, false, memory_order_release);
+        m->iconPath[0] = 0;
+        m->manufacturer[0] = 0;
+        m->transportType = 0;
+        m->sampleRate = kDefaultSampleRate;
+        snprintf(m->displayName, sizeof(m->displayName), "VolMirror Slot %d", i);
     }
 }
 
@@ -393,11 +407,23 @@ static OSStatus get_device_prop_size(int idx, const AudioObjectPropertyAddress* 
         }
         case kAudioDevicePropertyRelatedDevices:
             *outSize = sizeof(AudioObjectID); return noErr;
+        case kAudioDevicePropertyIcon: {
+            // Only advertise the property when the agent has supplied an icon.
+            pthread_mutex_lock(&gMirrors[idx].mu);
+            bool hasIcon = gMirrors[idx].iconPath[0] != 0;
+            pthread_mutex_unlock(&gMirrors[idx].mu);
+            if (!hasIcon) return kAudioHardwareUnknownPropertyError;
+            *outSize = sizeof(CFURLRef); return noErr;
+        }
         case kAudioObjectPropertyCustomPropertyInfoList:
-            *outSize = 2 * sizeof(AudioServerPlugInCustomPropertyInfo);
+            *outSize = 6 * sizeof(AudioServerPlugInCustomPropertyInfo);
             return noErr;
         case kVMProperty_FollowTarget:
         case kVMProperty_FollowName:
+        case kVMProperty_FollowIcon:
+        case kVMProperty_FollowManufacturer:
+        case kVMProperty_FollowRate:
+        case kVMProperty_FollowTransport:
             *outSize = sizeof(CFStringRef); return noErr;
     }
     return kAudioHardwareUnknownPropertyError;
@@ -419,8 +445,14 @@ static OSStatus get_device_prop(int idx, const AudioObjectPropertyAddress* a,
             pthread_mutex_unlock(&m->mu);
             WRITE_CSTR(buf);
         }
-        case kAudioObjectPropertyManufacturer:
-            WRITE_CSTR("VolMirror");
+        case kAudioObjectPropertyManufacturer: {
+            pthread_mutex_lock(&m->mu);
+            char buf[256];
+            snprintf(buf, sizeof(buf), "%s",
+                     m->manufacturer[0] ? m->manufacturer : "VolMirror");
+            pthread_mutex_unlock(&m->mu);
+            WRITE_CSTR(buf);
+        }
         case kAudioDevicePropertyDeviceUID: {
             pthread_mutex_lock(&m->mu);
             char buf[260]; snprintf(buf, sizeof(buf), "%s", m->uid);
@@ -429,8 +461,28 @@ static OSStatus get_device_prop(int idx, const AudioObjectPropertyAddress* a,
         }
         case kAudioDevicePropertyModelUID:
             WRITE_CSTR("com.joaopedro.VolMirror.model");
-        case kAudioDevicePropertyTransportType:
-            WRITE(UInt32, kAudioDeviceTransportTypeVirtual);
+        case kAudioDevicePropertyIcon: {
+            pthread_mutex_lock(&m->mu);
+            char buf[1024];
+            snprintf(buf, sizeof(buf), "%s", m->iconPath);
+            pthread_mutex_unlock(&m->mu);
+            if (buf[0] == 0) return kAudioHardwareUnknownPropertyError;
+            if (outDataSize) *outDataSize = sizeof(CFURLRef);
+            if (dataSize >= sizeof(CFURLRef)) {
+                CFStringRef p = CFStringCreateWithCString(NULL, buf, kCFStringEncodingUTF8);
+                CFURLRef url = CFURLCreateWithFileSystemPath(NULL, p, kCFURLPOSIXPathStyle, false);
+                CFRelease(p);
+                *(CFURLRef*)outData = url;     // caller releases
+                return noErr;
+            }
+            return kAudioHardwareBadPropertySizeError;
+        }
+        case kAudioDevicePropertyTransportType: {
+            pthread_mutex_lock(&m->mu);
+            UInt32 t = m->transportType ? m->transportType : kAudioDeviceTransportTypeVirtual;
+            pthread_mutex_unlock(&m->mu);
+            WRITE(UInt32, t);
+        }
         case kAudioDevicePropertyClockDomain:
             WRITE(UInt32, 0);
         case kAudioDevicePropertyClockAlgorithm:
@@ -512,16 +564,20 @@ static OSStatus get_device_prop(int idx, const AudioObjectPropertyAddress* a,
             }
             return kAudioHardwareBadPropertySizeError;
         case kAudioObjectPropertyCustomPropertyInfoList: {
-            if (outDataSize) *outDataSize = 2 * sizeof(AudioServerPlugInCustomPropertyInfo);
-            if (dataSize >= 2 * sizeof(AudioServerPlugInCustomPropertyInfo)) {
+            if (outDataSize) *outDataSize = 6 * sizeof(AudioServerPlugInCustomPropertyInfo);
+            if (dataSize >= 6 * sizeof(AudioServerPlugInCustomPropertyInfo)) {
                 AudioServerPlugInCustomPropertyInfo* info =
                     (AudioServerPlugInCustomPropertyInfo*)outData;
-                info[0].mSelector          = kVMProperty_FollowTarget;
-                info[0].mPropertyDataType  = kAudioServerPlugInCustomPropertyDataTypeCFString;
-                info[0].mQualifierDataType = kAudioServerPlugInCustomPropertyDataTypeNone;
-                info[1].mSelector          = kVMProperty_FollowName;
-                info[1].mPropertyDataType  = kAudioServerPlugInCustomPropertyDataTypeCFString;
-                info[1].mQualifierDataType = kAudioServerPlugInCustomPropertyDataTypeNone;
+                AudioObjectPropertySelector selectors[6] = {
+                    kVMProperty_FollowTarget,    kVMProperty_FollowName,
+                    kVMProperty_FollowIcon,      kVMProperty_FollowManufacturer,
+                    kVMProperty_FollowRate,      kVMProperty_FollowTransport,
+                };
+                for (int k = 0; k < 6; k++) {
+                    info[k].mSelector          = selectors[k];
+                    info[k].mPropertyDataType  = kAudioServerPlugInCustomPropertyDataTypeCFString;
+                    info[k].mQualifierDataType = kAudioServerPlugInCustomPropertyDataTypeNone;
+                }
                 return noErr;
             }
             return kAudioHardwareBadPropertySizeError;
@@ -538,23 +594,86 @@ static OSStatus get_device_prop(int idx, const AudioObjectPropertyAddress* a,
             pthread_mutex_unlock(&m->mu);
             WRITE_CSTR(buf);
         }
+        case kVMProperty_FollowIcon: {
+            pthread_mutex_lock(&m->mu);
+            char buf[1024]; snprintf(buf, sizeof(buf), "%s", m->iconPath);
+            pthread_mutex_unlock(&m->mu);
+            WRITE_CSTR(buf);
+        }
+        case kVMProperty_FollowManufacturer: {
+            pthread_mutex_lock(&m->mu);
+            char buf[256]; snprintf(buf, sizeof(buf), "%s", m->manufacturer);
+            pthread_mutex_unlock(&m->mu);
+            WRITE_CSTR(buf);
+        }
+        case kVMProperty_FollowRate: {
+            char buf[32];
+            pthread_mutex_lock(&m->mu);
+            snprintf(buf, sizeof(buf), "%.6f", m->sampleRate);
+            pthread_mutex_unlock(&m->mu);
+            WRITE_CSTR(buf);
+        }
+        case kVMProperty_FollowTransport: {
+            char buf[8] = {0};
+            pthread_mutex_lock(&m->mu);
+            UInt32 t = m->transportType;
+            pthread_mutex_unlock(&m->mu);
+            buf[0] = (char)((t >> 24) & 0xff);
+            buf[1] = (char)((t >> 16) & 0xff);
+            buf[2] = (char)((t >>  8) & 0xff);
+            buf[3] = (char)((t      ) & 0xff);
+            WRITE_CSTR(buf);
+        }
     }
     return kAudioHardwareUnknownPropertyError;
 }
 
-// Notify the host that the slot's identity (or visibility) changed. Called
-// after assignment changes; lets the OS UI re-query name/UID/IsHidden.
+// Notify the host that the slot's identity changed. Covers everything that
+// can flip on assignment (name, UID, icon, manufacturer, visibility) plus
+// the custom properties themselves so any listeners re-read.
 static void notify_slot_changed(int idx) {
     if (!gHost) return;
     static const AudioObjectPropertyAddress addrs[] = {
         { kAudioObjectPropertyName,           kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
+        { kAudioObjectPropertyManufacturer,   kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
         { kAudioDevicePropertyDeviceUID,      kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
         { kAudioDevicePropertyIsHidden,       kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
+        { kAudioDevicePropertyIcon,           kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
+        { kAudioDevicePropertyTransportType,  kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
         { kVMProperty_FollowTarget,           kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
         { kVMProperty_FollowName,             kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
+        { kVMProperty_FollowIcon,             kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
+        { kVMProperty_FollowManufacturer,     kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
+        { kVMProperty_FollowTransport,        kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
     };
     gHost->PropertiesChanged(gHost, dev_id(idx),
                              sizeof(addrs)/sizeof(addrs[0]), addrs);
+}
+
+// Fire the device-and-stream-level address chain for sample-rate changes.
+static void notify_rate_changed(int idx) {
+    if (!gHost) return;
+    static const AudioObjectPropertyAddress devAddrs[] = {
+        { kAudioDevicePropertyNominalSampleRate,
+          kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
+        { kAudioDevicePropertyAvailableNominalSampleRates,
+          kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
+        { kVMProperty_FollowRate,
+          kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
+    };
+    static const AudioObjectPropertyAddress streamAddrs[] = {
+        { kAudioStreamPropertyVirtualFormat,
+          kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
+        { kAudioStreamPropertyPhysicalFormat,
+          kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
+        { kAudioStreamPropertyAvailableVirtualFormats,
+          kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
+        { kAudioStreamPropertyAvailablePhysicalFormats,
+          kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
+    };
+    gHost->PropertiesChanged(gHost, dev_id(idx), 3, devAddrs);
+    gHost->PropertiesChanged(gHost, outstrm_id(idx), 4, streamAddrs);
+    gHost->PropertiesChanged(gHost, instrm_id(idx),  4, streamAddrs);
 }
 
 static OSStatus set_device_prop(int idx, const AudioObjectPropertyAddress* a,
@@ -586,6 +705,74 @@ static OSStatus set_device_prop(int idx, const AudioObjectPropertyAddress* a,
             else        snprintf(m->displayName, sizeof(m->displayName), "VolMirror Slot %d", idx);
             pthread_mutex_unlock(&m->mu);
             notify_slot_changed(idx);
+            return noErr;
+        }
+        case kVMProperty_FollowIcon: {
+            if (dataSize < sizeof(CFStringRef) || data == NULL)
+                return kAudioHardwareBadPropertySizeError;
+            CFStringRef s = *(CFStringRef*)data;
+            char buf[1024] = {0};
+            if (s) CFStringGetCString(s, buf, sizeof(buf), kCFStringEncodingUTF8);
+            pthread_mutex_lock(&m->mu);
+            snprintf(m->iconPath, sizeof(m->iconPath), "%s", buf);
+            pthread_mutex_unlock(&m->mu);
+            notify_slot_changed(idx);
+            return noErr;
+        }
+        case kVMProperty_FollowManufacturer: {
+            if (dataSize < sizeof(CFStringRef) || data == NULL)
+                return kAudioHardwareBadPropertySizeError;
+            CFStringRef s = *(CFStringRef*)data;
+            char buf[256] = {0};
+            if (s) CFStringGetCString(s, buf, sizeof(buf), kCFStringEncodingUTF8);
+            pthread_mutex_lock(&m->mu);
+            snprintf(m->manufacturer, sizeof(m->manufacturer), "%s", buf);
+            pthread_mutex_unlock(&m->mu);
+            notify_slot_changed(idx);
+            return noErr;
+        }
+        case kVMProperty_FollowRate: {
+            if (dataSize < sizeof(CFStringRef) || data == NULL)
+                return kAudioHardwareBadPropertySizeError;
+            CFStringRef s = *(CFStringRef*)data;
+            char buf[32] = {0};
+            if (s) CFStringGetCString(s, buf, sizeof(buf), kCFStringEncodingUTF8);
+            Float64 rate = strtod(buf, NULL);
+            if (!(rate > 0.0)) return kAudioHardwareIllegalOperationError;
+            pthread_mutex_lock(&m->mu);
+            // Refuse rate changes while IO is running — Apple's spec says rate
+            // changes go through RequestDeviceConfigurationChange. We avoid that
+            // dance by only allowing changes when the slot is quiescent.
+            bool busy = atomic_load_explicit(&m->ioRunning, memory_order_acquire) > 0;
+            if (!busy) m->sampleRate = rate;
+            pthread_mutex_unlock(&m->mu);
+            if (busy) return kAudioHardwareIllegalOperationError;
+            notify_rate_changed(idx);
+            return noErr;
+        }
+        case kVMProperty_FollowTransport: {
+            if (dataSize < sizeof(CFStringRef) || data == NULL)
+                return kAudioHardwareBadPropertySizeError;
+            CFStringRef s = *(CFStringRef*)data;
+            char buf[8] = {0};
+            if (s) CFStringGetCString(s, buf, sizeof(buf), kCFStringEncodingUTF8);
+            // Decode 4-char fourcc; "" clears (back to Virtual).
+            UInt32 t = ((UInt32)(unsigned char)buf[0] << 24)
+                     | ((UInt32)(unsigned char)buf[1] << 16)
+                     | ((UInt32)(unsigned char)buf[2] <<  8)
+                     | ((UInt32)(unsigned char)buf[3]      );
+            pthread_mutex_lock(&m->mu);
+            m->transportType = t;
+            pthread_mutex_unlock(&m->mu);
+            if (gHost) {
+                AudioObjectPropertyAddress addrs[2] = {
+                    { kAudioDevicePropertyTransportType,
+                      kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
+                    { kVMProperty_FollowTransport,
+                      kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
+                };
+                gHost->PropertiesChanged(gHost, dev_id(idx), 2, addrs);
+            }
             return noErr;
         }
     }
@@ -869,7 +1056,11 @@ static OSStatus VM_IsPropertySettable(AudioServerPlugInDriverRef d, AudioObjectI
         else if (o == mute_id(idx) && a->mSelector == kAudioBooleanControlPropertyValue) *out = true;
         else if (o == dev_id(idx) &&
                  (a->mSelector == kVMProperty_FollowTarget ||
-                  a->mSelector == kVMProperty_FollowName)) *out = true;
+                  a->mSelector == kVMProperty_FollowName ||
+                  a->mSelector == kVMProperty_FollowIcon ||
+                  a->mSelector == kVMProperty_FollowManufacturer ||
+                  a->mSelector == kVMProperty_FollowRate ||
+                  a->mSelector == kVMProperty_FollowTransport)) *out = true;
     }
     return noErr;
 }
@@ -1056,10 +1247,8 @@ static OSStatus VM_Initialize(AudioServerPlugInDriverRef d, AudioServerPlugInHos
         Mirror* m = &gMirrors[i];
         pthread_mutex_init(&m->mu, NULL);
         ring_init(&m->ring, kRingCapacity);
-        m->realUID[0] = 0;
-        snprintf(m->displayName, sizeof(m->displayName), "VolMirror Slot %d", i);
+        m->realUID[0] = 0;       // unassigned; slot_resync fills the rest
         slot_resync(m, i);
-        m->sampleRate = kDefaultSampleRate;
         atomic_init(&m->volume, 1.0f);
         atomic_init(&m->muted, false);
         atomic_init(&m->ioRunning, 0);
