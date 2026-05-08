@@ -1,9 +1,11 @@
-# VolMirror — CoreAudio HAL plugin
+# VolMirror — CoreAudio HAL plugin + userland agent
 #
-# Build:     make
-# Install:   sudo make install
-# Uninstall: sudo make uninstall
-# Reload:    sudo make reload   (restart coreaudiod without re-copying)
+# Build:           make
+# Install:         sudo make install
+# Uninstall:       sudo make uninstall
+# Reload all:      sudo make reload
+# Reload agent:    sudo make reload-agent     (no coreaudiod kill)
+# Reload driver:   sudo make reload-driver
 
 BUNDLE        := VolMirror
 EXT           := driver
@@ -14,23 +16,37 @@ MACOS_DIR     := $(CONTENTS_DIR)/MacOS
 EXECUTABLE    := $(MACOS_DIR)/$(BUNDLE)
 INSTALL_DIR   := /Library/Audio/Plug-Ins/HAL
 
-CC            := clang
-CFLAGS        := -O2 -Wall -Wextra -fvisibility=hidden -mmacosx-version-min=12.0
-LDFLAGS       := -bundle -framework CoreAudio -framework CoreFoundation
+AGENT_BIN            := $(BUILD_DIR)/VolMirrorAgent
+AGENT_INSTALL_DIR    := /usr/local/libexec
+AGENT_INSTALL        := $(AGENT_INSTALL_DIR)/VolMirrorAgent
+AGENT_PLIST          := com.joaopedro.VolMirror.agent.plist
+AGENT_PLIST_INSTALL  := /Library/LaunchAgents/$(AGENT_PLIST)
+AGENT_LABEL          := com.joaopedro.VolMirror.agent
 
-.PHONY: all clean install uninstall reload
+# Resolve the human user's UID even when running under sudo.
+USER_UID             := $(shell id -u $${SUDO_USER:-$$USER})
 
-all: $(EXECUTABLE) $(CONTENTS_DIR)/Info.plist
+CC             := clang
+CFLAGS         := -O2 -Wall -Wextra -fvisibility=hidden -mmacosx-version-min=12.0
+LDFLAGS_BUNDLE := -bundle -framework CoreAudio -framework CoreFoundation
+LDFLAGS_AGENT  := -framework CoreAudio -framework CoreFoundation
+
+.PHONY: all clean install uninstall reload reload-driver reload-agent
+
+all: $(EXECUTABLE) $(CONTENTS_DIR)/Info.plist $(AGENT_BIN)
 	@codesign --force --sign - $(BUNDLE_DIR)
-	@echo "Built $(BUNDLE_DIR)"
+	@echo "Built $(BUNDLE_DIR) and $(AGENT_BIN)"
 
 $(EXECUTABLE): Source/Plugin.c | $(MACOS_DIR)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $<
+	$(CC) $(CFLAGS) $(LDFLAGS_BUNDLE) -o $@ $<
+
+$(AGENT_BIN): Source/Agent.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(LDFLAGS_AGENT) -o $@ $<
 
 $(CONTENTS_DIR)/Info.plist: Source/Info.plist | $(CONTENTS_DIR)
 	cp $< $@
 
-$(MACOS_DIR) $(CONTENTS_DIR):
+$(MACOS_DIR) $(CONTENTS_DIR) $(BUILD_DIR):
 	@mkdir -p $@
 
 clean:
@@ -39,11 +55,22 @@ clean:
 install: all
 	rm -rf $(INSTALL_DIR)/$(BUNDLE).$(EXT)
 	cp -R $(BUNDLE_DIR) $(INSTALL_DIR)/$(BUNDLE).$(EXT)
+	mkdir -p $(AGENT_INSTALL_DIR)
+	cp $(AGENT_BIN) $(AGENT_INSTALL)
+	cp Source/$(AGENT_PLIST) $(AGENT_PLIST_INSTALL)
 	$(MAKE) reload
 
 uninstall:
+	-launchctl bootout gui/$(USER_UID)/$(AGENT_LABEL) 2>/dev/null || true
+	rm -f $(AGENT_INSTALL) $(AGENT_PLIST_INSTALL)
 	rm -rf $(INSTALL_DIR)/$(BUNDLE).$(EXT)
-	$(MAKE) reload
+	$(MAKE) reload-driver
 
-reload:
+reload: reload-driver reload-agent
+
+reload-driver:
 	@killall coreaudiod
+
+reload-agent:
+	-@launchctl bootout gui/$(USER_UID)/$(AGENT_LABEL) 2>/dev/null || true
+	@launchctl bootstrap gui/$(USER_UID) $(AGENT_PLIST_INSTALL)
