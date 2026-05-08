@@ -149,23 +149,26 @@ static AudioStreamBasicDescription asbd_for(Float64 rate) {
     return a;
 }
 
-// Volume taper.
-static const Float32 kMinDB = -96.0f;
+// Volume taper. Perceptually linear (loudness-linear): slider position ==
+// perceived loudness. Stevens' rule: +10 dB ≈ 2× loudness, so dB = 10·log2(s)
+// and gain = s^(1/(2·log10(2))) ≈ s^1.661. Slider 50% sounds half as loud.
+static const Float32 kMinDB = -60.0f;
+static const Float32 kLoudnessExp = 1.660964f;  // 1 / (2 * log10(2))
 static inline float scalar_to_gain(float s) {
     if (s <= 0.0f) return 0.0f;
     if (s >= 1.0f) return 1.0f;
-    return s * s;
+    return powf(s, kLoudnessExp);
 }
 static Float32 scalar_to_db(Float32 s) {
     if (s <= 0.0f) return kMinDB;
     if (s >= 1.0f) return 0.0f;
-    Float32 db = 40.0f * log10f(s);
+    Float32 db = 20.0f * kLoudnessExp * log10f(s);
     return db < kMinDB ? kMinDB : db;
 }
 static Float32 db_to_scalar(Float32 d) {
     if (!(d > kMinDB)) return 0.0f;
     if (d >= 0.0f)    return 1.0f;
-    return powf(10.0f, d / 40.0f);
+    return powf(10.0f, d / (20.0f * kLoudnessExp));
 }
 
 // Re-derive synthesized fields from realUID. Caller holds m->mu.
