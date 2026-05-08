@@ -20,15 +20,6 @@
 #include <math.h>
 
 #define VMLOG(fmt, ...) os_log(OS_LOG_DEFAULT, "[VolMirror] " fmt, ##__VA_ARGS__)
-// Set to 1 to log every property call (verbose). Off by default.
-#ifndef VOLMIRROR_LOG_PROPERTIES
-#define VOLMIRROR_LOG_PROPERTIES 0
-#endif
-#if VOLMIRROR_LOG_PROPERTIES
-#define VMLOG_PROP(...) VMLOG(__VA_ARGS__)
-#else
-#define VMLOG_PROP(...) ((void)0)
-#endif
 
 // ===========================================================================
 // Object ID layout
@@ -38,7 +29,7 @@
 #define kFirstMirrorObjectID    ((AudioObjectID)100)
 
 #define kFallbackSampleRate     48000.0  // used only when the real device's rate query fails
-#define kRingFrames             1024     // ZeroTimeStampPeriod
+#define kZeroTimeStampPeriod    16384    // ≥ 10923 per AudioServerPlugIn.h. Frames between successive zero timestamps.
 
 static inline AudioObjectID dev_id(int i) { return kFirstMirrorObjectID + i*10 + 0; }
 static inline AudioObjectID strm_id(int i){ return kFirstMirrorObjectID + i*10 + 1; }
@@ -79,7 +70,7 @@ typedef struct {
     _Atomic float       volume;             // 0..1, written by OS slider, read by RT thread
     _Atomic bool        muted;              // OS mute (F10 / menu bar) — read on RT path
     float               currentGain;        // last applied gain — producer-thread only, used for per-cycle ramp
-    _Atomic bool        ioRunning;          // read by RT WriteMix without locking
+    _Atomic UInt32      ioRunning;          // refcount of clients in StartIO; RT WriteMix reads as `> 0`
     _Atomic UInt64      ioStartHost;        // host-time fallback anchor (used only until first real_io_proc fires)
     Ring                ring;               // virtual-IOProc → real-IOProc
     AudioDeviceIOProcID realProc;           // our IOProc on the paired real device
@@ -105,9 +96,11 @@ static pthread_mutex_t              gListMu = PTHREAD_MUTEX_INITIALIZER;
 static mach_timebase_info_data_t    gTb;
 static dispatch_queue_t             gReconcileQ = NULL;     // serial
 static dispatch_source_t            gReconcileTimer = NULL; // debounce: collapses bursty hotplug events
+static atomic_bool                  gDiscoveryDone = false; // first-call lazy init guard
 
-// Forward decl — defined alongside reconcile_devices.
+// Forward decls — defined alongside reconcile_devices.
 static void schedule_reconcile(void);
+static void ensure_initial_discovery(void);
 
 // Stereo Float32 interleaved at the mirror's per-slot sample rate (matches the real device).
 static AudioStreamBasicDescription asbd_for(Float64 rate) {
@@ -215,24 +208,8 @@ static AudioServerPlugInDriverInterface* gInterfacePtr = &gInterface;
 // ===========================================================================
 // Property handling — plugin object
 // ===========================================================================
-static Boolean has_plugin_prop(const AudioObjectPropertyAddress* a) {
-    switch (a->mSelector) {
-        case kAudioObjectPropertyBaseClass:
-        case kAudioObjectPropertyClass:
-        case kAudioObjectPropertyOwner:
-        case kAudioObjectPropertyManufacturer:
-        case kAudioObjectPropertyOwnedObjects:
-        case kAudioPlugInPropertyBoxList:
-        case kAudioPlugInPropertyTranslateUIDToBox:
-        case kAudioPlugInPropertyDeviceList:
-        case kAudioPlugInPropertyTranslateUIDToDevice:
-        case kAudioPlugInPropertyResourceBundle:
-            return true;
-    }
-    return false;
-}
-
 static OSStatus get_plugin_prop_size(const AudioObjectPropertyAddress* a, UInt32* outSize) {
+    ensure_initial_discovery();
     switch (a->mSelector) {
         case kAudioObjectPropertyBaseClass:
         case kAudioObjectPropertyClass:
@@ -241,20 +218,16 @@ static OSStatus get_plugin_prop_size(const AudioObjectPropertyAddress* a, UInt32
         case kAudioObjectPropertyManufacturer:
         case kAudioPlugInPropertyResourceBundle:
             *outSize = sizeof(CFStringRef); return noErr;
+        case kAudioPlugInPropertyBoxList:
+            *outSize = 0; return noErr;
         case kAudioObjectPropertyOwnedObjects:
-        case kAudioPlugInPropertyDeviceList:
-        case kAudioPlugInPropertyBoxList: {
+        case kAudioPlugInPropertyDeviceList: {
             int n = 0;
             pthread_mutex_lock(&gListMu);
             for (int i = 0; i < kMaxMirrors; i++)
                 if (atomic_load_explicit(&gMirrors[i].active, memory_order_acquire)) n++;
             pthread_mutex_unlock(&gListMu);
-            // BoxList is empty; OwnedObjects + DeviceList contain the mirror devices.
-            if (a->mSelector == kAudioPlugInPropertyBoxList) {
-                *outSize = 0;
-            } else {
-                *outSize = (UInt32)(n * sizeof(AudioObjectID));
-            }
+            *outSize = (UInt32)(n * sizeof(AudioObjectID));
             return noErr;
         }
         case kAudioPlugInPropertyTranslateUIDToBox:
@@ -268,6 +241,7 @@ static OSStatus get_plugin_prop(const AudioObjectPropertyAddress* a, UInt32 data
                                 const void* qual, UInt32* outDataSize, void* outData,
                                 UInt32 qualSize) {
     (void)qualSize;
+    ensure_initial_discovery();
     switch (a->mSelector) {
         case kAudioObjectPropertyBaseClass:
             WRITE(AudioClassID, kAudioObjectClassID);
@@ -334,38 +308,6 @@ static UInt32 streams_for_scope(int idx, AudioObjectPropertyScope scope,
     return n;
 }
 
-static Boolean has_device_prop(int idx, const AudioObjectPropertyAddress* a) {
-    (void)idx;
-    switch (a->mSelector) {
-        case kAudioObjectPropertyBaseClass:
-        case kAudioObjectPropertyClass:
-        case kAudioObjectPropertyOwner:
-        case kAudioObjectPropertyName:
-        case kAudioObjectPropertyManufacturer:
-        case kAudioObjectPropertyOwnedObjects:
-        case kAudioDevicePropertyDeviceUID:
-        case kAudioDevicePropertyModelUID:
-        case kAudioDevicePropertyTransportType:
-        case kAudioDevicePropertyRelatedDevices:
-        case kAudioDevicePropertyClockDomain:
-        case kAudioDevicePropertyDeviceIsAlive:
-        case kAudioDevicePropertyDeviceIsRunning:
-        case kAudioObjectPropertyControlList:
-        case kAudioDevicePropertyNominalSampleRate:
-        case kAudioDevicePropertyAvailableNominalSampleRates:
-        case kAudioDevicePropertyIsHidden:
-        case kAudioDevicePropertyZeroTimeStampPeriod:
-        case kAudioDevicePropertyStreams:
-        case kAudioDevicePropertyLatency:
-        case kAudioDevicePropertySafetyOffset:
-        case kAudioDevicePropertyDeviceCanBeDefaultDevice:
-        case kAudioDevicePropertyDeviceCanBeDefaultSystemDevice:
-        case kAudioDevicePropertyPreferredChannelsForStereo:
-            return true;
-    }
-    return false;
-}
-
 static OSStatus get_device_prop_size(int idx, const AudioObjectPropertyAddress* a,
                                      UInt32* outSize) {
     switch (a->mSelector) {
@@ -380,6 +322,8 @@ static OSStatus get_device_prop_size(int idx, const AudioObjectPropertyAddress* 
             *outSize = sizeof(CFStringRef); return noErr;
         case kAudioDevicePropertyTransportType:
         case kAudioDevicePropertyClockDomain:
+        case kAudioDevicePropertyClockAlgorithm:
+        case kAudioDevicePropertyClockIsStable:
         case kAudioDevicePropertyDeviceIsAlive:
         case kAudioDevicePropertyDeviceIsRunning:
         case kAudioDevicePropertyIsHidden:
@@ -440,18 +384,25 @@ static OSStatus get_device_prop(int idx, const AudioObjectPropertyAddress* a,
             WRITE(UInt32, kAudioDeviceTransportTypeVirtual);
         case kAudioDevicePropertyClockDomain:
             WRITE(UInt32, 0);
+        case kAudioDevicePropertyClockAlgorithm:
+            // Default smoother. Our published timestamps are anchored to the real
+            // device's clock and seqlock-protected, so light filtering is enough.
+            WRITE(UInt32, kAudioDeviceClockAlgorithmSimpleIIR);
+        case kAudioDevicePropertyClockIsStable:
+            WRITE(UInt32, 1);
         case kAudioDevicePropertyDeviceIsAlive:
             WRITE(UInt32, 1);
         case kAudioDevicePropertyDeviceIsRunning:
-            WRITE(UInt32, atomic_load_explicit(&m->ioRunning, memory_order_relaxed) ? 1 : 0);
+            WRITE(UInt32, atomic_load_explicit(&m->ioRunning, memory_order_relaxed) > 0 ? 1 : 0);
         case kAudioDevicePropertyIsHidden:
             WRITE(UInt32, 0);
         case kAudioDevicePropertyZeroTimeStampPeriod:
-            WRITE(UInt32, kRingFrames);
+            WRITE(UInt32, kZeroTimeStampPeriod);
         case kAudioDevicePropertyLatency:
-            // One IO cycle through the SPSC ring; the real device contributes its own
-            // latency separately (read by clients via the realID).
-            WRITE(UInt32, kRingFrames);
+            // SPSC-ring buffering only; the real device contributes its own latency
+            // separately (read by clients via the realID). Decoupled from
+            // kZeroTimeStampPeriod, which is host-clock reporting metadata, not delay.
+            WRITE(UInt32, 1024);
         case kAudioDevicePropertySafetyOffset:
             WRITE(UInt32, 0);
         case kAudioDevicePropertyDeviceCanBeDefaultDevice:
@@ -518,35 +469,9 @@ static OSStatus get_device_prop(int idx, const AudioObjectPropertyAddress* a,
     return kAudioHardwareUnknownPropertyError;
 }
 
-static OSStatus set_device_prop(int idx, const AudioObjectPropertyAddress* a,
-                                UInt32 dataSize, const void* data) {
-    (void)idx; (void)a; (void)dataSize; (void)data;
-    return kAudioHardwareUnknownPropertyError;
-}
-
 // ===========================================================================
 // Property handling — stream
 // ===========================================================================
-static Boolean has_stream_prop(const AudioObjectPropertyAddress* a) {
-    switch (a->mSelector) {
-        case kAudioObjectPropertyBaseClass:
-        case kAudioObjectPropertyClass:
-        case kAudioObjectPropertyOwner:
-        case kAudioObjectPropertyOwnedObjects:
-        case kAudioStreamPropertyIsActive:
-        case kAudioStreamPropertyDirection:
-        case kAudioStreamPropertyTerminalType:
-        case kAudioStreamPropertyStartingChannel:
-        case kAudioStreamPropertyLatency:
-        case kAudioStreamPropertyVirtualFormat:
-        case kAudioStreamPropertyAvailableVirtualFormats:
-        case kAudioStreamPropertyPhysicalFormat:
-        case kAudioStreamPropertyAvailablePhysicalFormats:
-            return true;
-    }
-    return false;
-}
-
 static OSStatus get_stream_prop_size(const AudioObjectPropertyAddress* a, UInt32* outSize) {
     switch (a->mSelector) {
         case kAudioObjectPropertyBaseClass:
@@ -623,24 +548,6 @@ static OSStatus get_stream_prop(int idx, const AudioObjectPropertyAddress* a,
 // ===========================================================================
 // Property handling — volume control
 // ===========================================================================
-static Boolean has_volume_prop(const AudioObjectPropertyAddress* a) {
-    switch (a->mSelector) {
-        case kAudioObjectPropertyBaseClass:
-        case kAudioObjectPropertyClass:
-        case kAudioObjectPropertyOwner:
-        case kAudioObjectPropertyOwnedObjects:
-        case kAudioControlPropertyScope:
-        case kAudioControlPropertyElement:
-        case kAudioLevelControlPropertyScalarValue:
-        case kAudioLevelControlPropertyDecibelValue:
-        case kAudioLevelControlPropertyDecibelRange:
-        case kAudioLevelControlPropertyConvertScalarToDecibels:
-        case kAudioLevelControlPropertyConvertDecibelsToScalar:
-            return true;
-    }
-    return false;
-}
-
 static OSStatus get_volume_prop_size(const AudioObjectPropertyAddress* a, UInt32* outSize) {
     switch (a->mSelector) {
         case kAudioObjectPropertyBaseClass:
@@ -739,6 +646,17 @@ static OSStatus get_volume_prop(int idx, const AudioObjectPropertyAddress* a,
     return kAudioHardwareUnknownPropertyError;
 }
 
+static void notify_volume_changed(int idx) {
+    if (!gHost) return;
+    static const AudioObjectPropertyAddress changed[2] = {
+        { kAudioLevelControlPropertyScalarValue,
+          kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
+        { kAudioLevelControlPropertyDecibelValue,
+          kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
+    };
+    gHost->PropertiesChanged(gHost, volc_id(idx), 2, changed);
+}
+
 static OSStatus set_volume_prop(int idx, const AudioObjectPropertyAddress* a,
                                 UInt32 dataSize, const void* data) {
     Mirror* m = &gMirrors[idx];
@@ -749,27 +667,14 @@ static OSStatus set_volume_prop(int idx, const AudioObjectPropertyAddress* a,
             // Negated comparisons so NaN falls into the clamp branch.
             if (!(v >= 0.0f)) v = 0.0f; else if (v > 1.0f) v = 1.0f;
             atomic_store_explicit(&m->volume, v, memory_order_relaxed);
-            // Notify the host that scalar + dB both changed.
-            AudioObjectPropertyAddress changed[2] = {
-                { kAudioLevelControlPropertyScalarValue,
-                  kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
-                { kAudioLevelControlPropertyDecibelValue,
-                  kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
-            };
-            if (gHost) gHost->PropertiesChanged(gHost, volc_id(idx), 2, changed);
+            notify_volume_changed(idx);
             return noErr;
         }
         case kAudioLevelControlPropertyDecibelValue: {
             if (dataSize < sizeof(Float32)) return kAudioHardwareBadPropertySizeError;
             Float32 v = db_to_scalar(*(const Float32*)data);
             atomic_store_explicit(&m->volume, v, memory_order_relaxed);
-            AudioObjectPropertyAddress changed[2] = {
-                { kAudioLevelControlPropertyScalarValue,
-                  kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
-                { kAudioLevelControlPropertyDecibelValue,
-                  kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
-            };
-            if (gHost) gHost->PropertiesChanged(gHost, volc_id(idx), 2, changed);
+            notify_volume_changed(idx);
             return noErr;
         }
     }
@@ -779,20 +684,6 @@ static OSStatus set_volume_prop(int idx, const AudioObjectPropertyAddress* a,
 // ===========================================================================
 // Property handling — mute control
 // ===========================================================================
-static Boolean has_mute_prop(const AudioObjectPropertyAddress* a) {
-    switch (a->mSelector) {
-        case kAudioObjectPropertyBaseClass:
-        case kAudioObjectPropertyClass:
-        case kAudioObjectPropertyOwner:
-        case kAudioObjectPropertyOwnedObjects:
-        case kAudioControlPropertyScope:
-        case kAudioControlPropertyElement:
-        case kAudioBooleanControlPropertyValue:
-            return true;
-    }
-    return false;
-}
-
 static OSStatus get_mute_prop_size(const AudioObjectPropertyAddress* a, UInt32* outSize) {
     switch (a->mSelector) {
         case kAudioObjectPropertyBaseClass:
@@ -859,38 +750,10 @@ static OSStatus set_mute_prop(int idx, const AudioObjectPropertyAddress* a,
 // Forward decl — used by real_is_output_with_locked_volume below.
 static void copy_device_uid(AudioObjectID dev, char* dst, size_t dstSize);
 
-__attribute__((unused))
-static const char* fourcc_str(UInt32 c, char* buf) {
-    buf[0] = (char)(c >> 24); buf[1] = (char)(c >> 16);
-    buf[2] = (char)(c >> 8);  buf[3] = (char)c; buf[4] = 0;
-    for (int i = 0; i < 4; i++) if (buf[i] < 32 || buf[i] > 126) buf[i] = '?';
-    return buf;
-}
-
 static Boolean VM_HasProperty(AudioServerPlugInDriverRef d, AudioObjectID o, pid_t c,
                               const AudioObjectPropertyAddress* a) {
-    (void)d; (void)c;
-    if (a == NULL) return false;
-    Boolean r = false;
-    if (o == kPlugInObjectID) r = has_plugin_prop(a);
-    else {
-        int idx = object_to_mirror(o);
-        if (idx >= 0 && atomic_load_explicit(&gMirrors[idx].active, memory_order_acquire)) {
-            if (o == dev_id(idx))       r = has_device_prop(idx, a);
-            else if (o == strm_id(idx)) r = has_stream_prop(a);
-            else if (o == volc_id(idx)) r = has_volume_prop(a);
-            else if (o == mute_id(idx)) r = has_mute_prop(a);
-        }
-    }
-#if VOLMIRROR_LOG_PROPERTIES
-    char fc[5];
-    VMLOG_PROP("HasProperty(obj=%{public}u sel=%{public}s scope=%{public}s) -> %{public}d",
-          (unsigned)o, fourcc_str(a->mSelector, fc),
-          a->mScope == kAudioObjectPropertyScopeOutput ? "out" :
-          a->mScope == kAudioObjectPropertyScopeInput ? "in" : "glo",
-          (int)r);
-#endif
-    return r;
+    UInt32 dummy;
+    return VM_GetPropertyDataSize(d, o, c, a, 0, NULL, &dummy) == noErr;
 }
 
 static OSStatus VM_IsPropertySettable(AudioServerPlugInDriverRef d, AudioObjectID o,
@@ -947,12 +810,6 @@ static OSStatus VM_GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID o
         else if (o == mute_id(idx)) r = get_mute_prop(idx, a, dataSize, outDataSize, outData);
         else r = kAudioHardwareBadObjectError;
     }
-#if VOLMIRROR_LOG_PROPERTIES
-    char fc[5];
-    VMLOG_PROP("GetPropertyData(obj=%{public}u sel=%{public}s) -> %{public}d size=%{public}u",
-          (unsigned)o, fourcc_str(a ? a->mSelector : 0, fc),
-          (int)r, outDataSize ? *outDataSize : 0);
-#endif
     return r;
 }
 
@@ -967,7 +824,6 @@ static OSStatus VM_SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID o
         return kAudioHardwareBadObjectError;
     if (o == volc_id(idx)) return set_volume_prop(idx, a, dataSize, data);
     if (o == mute_id(idx)) return set_mute_prop(idx, a, dataSize, data);
-    if (o == dev_id(idx))  return set_device_prop(idx, a, dataSize, data);
     return kAudioHardwareUnknownPropertyError;
 }
 
@@ -1104,8 +960,8 @@ static OSStatus real_io_proc(AudioObjectID inDevice,
 
         Float64 virtSample = realSample - m->realRefSample;
         if (virtSample < 0.0) virtSample = 0.0;
-        UInt64 cycles = (UInt64)(virtSample / (Float64)kRingFrames);
-        UInt64 zeroSample = cycles * kRingFrames;
+        UInt64 cycles = (UInt64)(virtSample / (Float64)kZeroTimeStampPeriod);
+        UInt64 zeroSample = cycles * kZeroTimeStampPeriod;
         Float64 frac = virtSample - (Float64)zeroSample;
         UInt64 fracTicks = (UInt64)(frac * 1.0e9 / m->sampleRate
                                       * (Float64)gTb.denom / (Float64)gTb.numer);
@@ -1135,11 +991,19 @@ static OSStatus VM_StartIO(AudioServerPlugInDriverRef d, AudioObjectID id, UInt3
     Mirror* m = &gMirrors[idx];
 
     pthread_mutex_lock(&m->mu);
-    if (atomic_load_explicit(&m->ioRunning, memory_order_relaxed)) {
+    UInt32 prev = atomic_load_explicit(&m->ioRunning, memory_order_relaxed);
+    if (prev == UINT32_MAX) {
+        pthread_mutex_unlock(&m->mu);
+        return kAudioHardwareIllegalOperationError;
+    }
+    if (prev > 0) {
+        // IO already up for another client — just bump the refcount.
+        atomic_store_explicit(&m->ioRunning, prev + 1, memory_order_release);
         pthread_mutex_unlock(&m->mu);
         return noErr;
     }
 
+    // 0 → 1: bring up the real-device IOProc.
     ring_reset(&m->ring);
     m->currentGain = 0.0f;  // ramp up from silence on the first cycle to avoid a pop at stream start
 
@@ -1171,7 +1035,7 @@ static OSStatus VM_StartIO(AudioServerPlugInDriverRef d, AudioObjectID id, UInt3
         return err;
     }
 
-    atomic_store_explicit(&m->ioRunning, true, memory_order_release);
+    atomic_store_explicit(&m->ioRunning, 1, memory_order_release);
     pthread_mutex_unlock(&m->mu);
     VMLOG("StartIO: forwarding mirror %{public}d → real %{public}u", idx, (unsigned)m->realID);
     return noErr;
@@ -1186,12 +1050,22 @@ static OSStatus VM_StopIO(AudioServerPlugInDriverRef d, AudioObjectID id, UInt32
     Mirror* m = &gMirrors[idx];
 
     pthread_mutex_lock(&m->mu);
-    if (!atomic_load_explicit(&m->ioRunning, memory_order_relaxed)) {
+    UInt32 prev = atomic_load_explicit(&m->ioRunning, memory_order_relaxed);
+    if (prev == 0) {
+        // No client had IO going. Tolerate (instead of erroring): hotplug-driven
+        // teardown can race with a client's StopIO and zero the counter first.
+        pthread_mutex_unlock(&m->mu);
+        return noErr;
+    }
+    if (prev > 1) {
+        // Other clients still running — just decrement.
+        atomic_store_explicit(&m->ioRunning, prev - 1, memory_order_release);
         pthread_mutex_unlock(&m->mu);
         return noErr;
     }
 
-    atomic_store_explicit(&m->ioRunning, false, memory_order_release);
+    // 1 → 0: tear down the real-device IOProc.
+    atomic_store_explicit(&m->ioRunning, 0, memory_order_release);
     if (m->realProc) {
         AudioDeviceStop(m->realID, m->realProc);
         AudioDeviceDestroyIOProcID(m->realID, m->realProc);
@@ -1259,7 +1133,7 @@ static OSStatus VM_DoIOOperation(AudioServerPlugInDriverRef d, AudioObjectID id,
     if (idx < 0 || !atomic_load_explicit(&gMirrors[idx].active, memory_order_acquire))
         return noErr;
     Mirror* m = &gMirrors[idx];
-    if (!atomic_load_explicit(&m->ioRunning, memory_order_acquire)) return noErr;
+    if (atomic_load_explicit(&m->ioRunning, memory_order_acquire) == 0) return noErr;
     float scalar = atomic_load_explicit(&m->volume, memory_order_relaxed);
     bool muted = atomic_load_explicit(&m->muted, memory_order_relaxed);
     float targetGain = muted ? 0.0f : scalar_to_gain(scalar);
@@ -1420,7 +1294,7 @@ static void reconcile_devices(void) {
             VMLOG("reconcile: removing mirror %{public}d (%{public}s)",
                   i, gMirrors[i].displayName);
             pthread_mutex_lock(&gMirrors[i].mu);
-            atomic_store_explicit(&gMirrors[i].ioRunning, false, memory_order_release);
+            atomic_store_explicit(&gMirrors[i].ioRunning, 0, memory_order_release);
             if (gMirrors[i].realProc) {
                 AudioDeviceStop(gMirrors[i].realID, gMirrors[i].realProc);
                 AudioDeviceDestroyIOProcID(gMirrors[i].realID, gMirrors[i].realProc);
@@ -1463,7 +1337,7 @@ static void reconcile_devices(void) {
         m->sampleRate = device_nominal_rate(locked[j].id);
         atomic_store_explicit(&m->volume, 1.0f, memory_order_relaxed);
         atomic_store_explicit(&m->muted, false, memory_order_relaxed);
-        atomic_store_explicit(&m->ioRunning, false, memory_order_relaxed);
+        atomic_store_explicit(&m->ioRunning, 0, memory_order_relaxed);
         atomic_store_explicit(&m->ioStartHost, 0, memory_order_relaxed);
         m->realProc = NULL;
         atomic_store_explicit(&m->active, true, memory_order_release);
@@ -1482,54 +1356,29 @@ static void reconcile_devices(void) {
     }
 }
 
-// Reconcile runs at load time and again whenever the system fires a
-// kAudioHardwarePropertyDevices change (see VM_Initialize). All scans go
-// through gReconcileQ, so a hotplug burst can never run reconcile_devices
-// concurrently with itself.
+// Reconcile runs lazily on the first plugin-property query (see
+// ensure_initial_discovery) and again whenever the system fires a
+// kAudioHardwarePropertyDevices change. Hotplug-driven scans go through
+// gReconcileQ, so a hotplug burst can never run reconcile_devices
+// concurrently with itself; the lazy first-call path serializes against
+// hotplug scans via gListMu inside reconcile_devices.
 
-// ===========================================================================
-// Lifecycle stubs
-// ===========================================================================
-static OSStatus VM_Initialize(AudioServerPlugInDriverRef d, AudioServerPlugInHostRef h) {
-    (void)d;
-    VMLOG("VM_Initialize called");
-    gHost = h;
-    mach_timebase_info(&gTb);
-    // Eagerly init every slot's mutex + ring once, so reconcile_devices never
-    // has to (re-)init in place and the RT producer never sees a freed buffer.
-    for (int i = 0; i < kMaxMirrors; i++) {
-        pthread_mutex_init(&gMirrors[i].mu, NULL);
-        ring_init(&gMirrors[i].ring, kRingCapacity);
-        atomic_init(&gMirrors[i].active, false);
-        atomic_init(&gMirrors[i].volume, 1.0f);
-        atomic_init(&gMirrors[i].muted, false);
-        atomic_init(&gMirrors[i].ioRunning, false);
-        atomic_init(&gMirrors[i].ioStartHost, 0);
-        atomic_init(&gMirrors[i].driftSeq, 0);
-        atomic_init(&gMirrors[i].driftPrimed, false);
-        atomic_init(&gMirrors[i].driftSeed, 1);
-        gMirrors[i].driftSampleTime = 0;
-        gMirrors[i].driftHostTime = 0;
-        gMirrors[i].realRefSample = 0.0;
-        gMirrors[i].sampleRate = kFallbackSampleRate;
-        gMirrors[i].currentGain = 0.0f;
-    }
-    // Serial queue: the initial scan and every hotplug-driven scan run one
-    // at a time, so reconcile_devices never overlaps with itself even under
-    // a burst of plug events.
-    gReconcileQ = dispatch_queue_create("com.joaopedro.VolMirror.reconcile",
-                                         DISPATCH_QUEUE_SERIAL);
-    // No XPC calls inline (they can hang during plugin init). Initial scan,
-    // listener registration, and debounce-timer setup all run on gReconcileQ
-    // after VM_Initialize has returned.
+// First-call init: dispatched from the property handler so the helper
+// process is provably alive (coreaudiod just XPC'd into us). The actual
+// reconcile + listener registration runs ASYNC on gReconcileQ — running
+// XPC calls inline on the property-handler thread would re-enter
+// coreaudiod and deadlock. reconcile_devices fires PropertiesChanged
+// when done, prompting coreaudiod to re-query and see the populated list.
+// Idempotent: cheap atomic-load fast path on subsequent calls.
+static void ensure_initial_discovery(void) {
+    if (atomic_load_explicit(&gDiscoveryDone, memory_order_acquire)) return;
+    bool expected = false;
+    if (!atomic_compare_exchange_strong_explicit(
+            &gDiscoveryDone, &expected, true,
+            memory_order_acq_rel, memory_order_relaxed)) return;
+
     dispatch_async(gReconcileQ, ^{
         reconcile_devices();
-        // Debounce timer for hotplug-driven reconciles. One-shot per arming;
-        // schedule_reconcile() re-arms it.
-        gReconcileTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER,
-                                                  0, 0, gReconcileQ);
-        dispatch_source_set_event_handler(gReconcileTimer, ^{ reconcile_devices(); });
-        dispatch_resume(gReconcileTimer);
 
         static const AudioObjectPropertyAddress kDevicesAddr = {
             kAudioHardwarePropertyDevices,
@@ -1547,6 +1396,45 @@ static OSStatus VM_Initialize(AudioServerPlugInDriverRef d, AudioServerPlugInHos
         else
             VMLOG("hotplug: listening for kAudioHardwarePropertyDevices");
     });
+}
+
+// ===========================================================================
+// Lifecycle stubs
+// ===========================================================================
+static OSStatus VM_Initialize(AudioServerPlugInDriverRef d, AudioServerPlugInHostRef h) {
+    (void)d;
+    VMLOG("VM_Initialize called");
+    gHost = h;
+    mach_timebase_info(&gTb);
+    // Eagerly init every slot's mutex + ring once, so reconcile_devices never
+    // has to (re-)init in place and the RT producer never sees a freed buffer.
+    for (int i = 0; i < kMaxMirrors; i++) {
+        pthread_mutex_init(&gMirrors[i].mu, NULL);
+        ring_init(&gMirrors[i].ring, kRingCapacity);
+        atomic_init(&gMirrors[i].active, false);
+        atomic_init(&gMirrors[i].volume, 1.0f);
+        atomic_init(&gMirrors[i].muted, false);
+        atomic_init(&gMirrors[i].ioRunning, 0);
+        atomic_init(&gMirrors[i].ioStartHost, 0);
+        atomic_init(&gMirrors[i].driftSeq, 0);
+        atomic_init(&gMirrors[i].driftPrimed, false);
+        atomic_init(&gMirrors[i].driftSeed, 1);
+        gMirrors[i].driftSampleTime = 0;
+        gMirrors[i].driftHostTime = 0;
+        gMirrors[i].realRefSample = 0.0;
+        gMirrors[i].sampleRate = kFallbackSampleRate;
+        gMirrors[i].currentGain = 0.0f;
+    }
+    // Serial queue + debounce timer for hotplug-driven reconciles. These are
+    // pure dispatch primitives (no XPC) so they're safe to set up inline.
+    // The actual device discovery + listener registration happens lazily on
+    // the first GetPropertyData(DeviceList) call — see ensure_initial_discovery.
+    gReconcileQ = dispatch_queue_create("com.joaopedro.VolMirror.reconcile",
+                                         DISPATCH_QUEUE_SERIAL);
+    gReconcileTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER,
+                                              0, 0, gReconcileQ);
+    dispatch_source_set_event_handler(gReconcileTimer, ^{ reconcile_devices(); });
+    dispatch_resume(gReconcileTimer);
     return noErr;
 }
 
