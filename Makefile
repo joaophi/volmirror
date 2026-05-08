@@ -77,11 +77,9 @@ reload: reload-driver reload-agent
 reload-driver:
 	@killall coreaudiod
 
-# If the agent's already bootstrapped, kickstart it (instant restart, works on
-# user-domain services even with SIP). Only bootstrap on first install.
+# Always tear down and bootstrap fresh — picks up plist changes and survives
+# loaded-but-throttled or loaded-but-failed-to-spawn states.
 reload-agent:
-	@if launchctl print gui/$(USER_UID)/$(AGENT_LABEL) >/dev/null 2>&1; then \
-		launchctl kickstart -k gui/$(USER_UID)/$(AGENT_LABEL); \
-	else \
-		launchctl bootstrap gui/$(USER_UID) $(AGENT_PLIST_INSTALL); \
-	fi
+	-@launchctl bootout gui/$(USER_UID)/$(AGENT_LABEL) 2>/dev/null
+	-@sleep 0.3
+	@launchctl bootstrap gui/$(USER_UID) $(AGENT_PLIST_INSTALL)
